@@ -1,9 +1,9 @@
 /**
  * @file mcp_message.h
  * @brief Core definitions for the Model Context Protocol (MCP) framework
- * 
+ *
  * This file contains the core structures and definitions for the MCP protocol.
- * Implements the 2024-11-05 basic protocol specification.
+ * Implements the 2025-03-26 protocol specification.
  */
 
 #ifndef MCP_MESSAGE_H
@@ -25,7 +25,7 @@ namespace mcp {
 using json = nlohmann::ordered_json;
 
 // MCP version
-constexpr const char* MCP_VERSION = "2024-11-05";
+constexpr const char* MCP_VERSION = "2025-03-26";
 
 // MCP error codes (JSON-RPC 2.0 standard codes)
 enum class error_code {
@@ -112,10 +112,10 @@ struct request {
 
     static request from_json(const json& j) {
         request req;
-        req.jsonrpc = j["jsonrpc"].get<std::string>();
-        req.id = j["id"];
-        req.method = j["method"].get<std::string>();
-        req.params = j["params"];
+        req.jsonrpc = j.value("jsonrpc", "2.0");
+        req.id = j.contains("id") ? j["id"] : json(nullptr);
+        req.method = j.value("method", "");
+        req.params = j.contains("params") ? j["params"] : json::object();
         return req;
     }
     
@@ -183,10 +183,10 @@ struct response {
 
     static response from_json(const json& j) {
         response res;
-        res.jsonrpc = j["jsonrpc"].get<std::string>();
-        res.id = j["id"];
-        res.result = j["result"];
-        res.error = j["error"];
+        res.jsonrpc = j.value("jsonrpc", "2.0");
+        res.id = j.contains("id") ? j["id"] : json(nullptr);
+        if (j.contains("result")) res.result = j["result"];
+        if (j.contains("error")) res.error = j["error"];
         return res;
     }
 };

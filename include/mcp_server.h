@@ -1,9 +1,9 @@
 /**
  * @file mcp_server.h
  * @brief MCP Server implementation
- * 
+ *
  * This file implements the server-side functionality for the Model Context Protocol.
- * Follows the 2024-11-05 basic protocol specification.
+ * Supports both 2025-03-26 Streamable HTTP and 2024-11-05 HTTP+SSE transports.
  */
 
 #ifndef MCP_SERVER_H
@@ -29,6 +29,7 @@
 #include <condition_variable>
 #include <future>
 #include <atomic>
+#include <optional>
 
 
 namespace mcp {
@@ -53,29 +54,29 @@ public:
         if (!sink || closed_.load(std::memory_order_acquire)) {
             return false;
         }
-        
+
         std::string message_copy;
         {
             std::unique_lock<std::mutex> lk(m_);
-            
+
             if (closed_.load(std::memory_order_acquire)) {
                 return false;
             }
-            
+
             int id = id_.load(std::memory_order_relaxed);
-            
-            bool result = cv_.wait_for(lk, timeout, [&] { 
-                return cid_.load(std::memory_order_relaxed) == id || closed_.load(std::memory_order_acquire); 
+
+            bool result = cv_.wait_for(lk, timeout, [&] {
+                return cid_.load(std::memory_order_relaxed) == id || closed_.load(std::memory_order_acquire);
             });
-            
+
             if (closed_.load(std::memory_order_acquire)) {
                 return false;
             }
-            
+
             if (!result) {
                 return false;
             }
-            
+
             // Only copy the message if there is one
             if (!message_.empty()) {
                 message_copy.swap(message_);
@@ -83,7 +84,7 @@ public:
                 return true; // No message but condition satisfied
             }
         }
-        
+
         try {
             if (!message_copy.empty()) {
                 if (!sink->write(message_copy.data(), message_copy.size())) {
@@ -172,21 +173,67 @@ private:
  */
 class server {
 public:
+
+    /**
+     * @struct configuration
+     * @brief Configuration settings for the server.
+     *
+     * This struct holds all configurable parameters for the server, including
+     * network bindings, identification, and endpoint paths. If SSL is enabled,
+     * it also includes paths to the server certificate and private key.
+     */
+    struct configuration {
+        /** Host to bind to (e.g., "localhost", "0.0.0.0") */
+        std::string host{ "localhost" };
+
+        /** Port to listen on */
+        int port{ 8080 };
+
+        /** Server name */
+        std::string name{ "MCP Server" };
+
+        /** Server version */
+        std::string version{ "0.0.1" };
+
+        /** SSE endpoint path */
+        std::string sse_endpoint{ "/sse" };
+
+        /** Message endpoint path (legacy HTTP+SSE transport) */
+        std::string msg_endpoint{ "/message" };
+
+        /** Streamable HTTP endpoint path (2025-03-26 transport) */
+        std::string mcp_endpoint{ "/mcp" };
+
+        unsigned int threadpool_size{ std::thread::hardware_concurrency() };
+
+        /** Maximum concurrent sessions (0 = unlimited) */
+        unsigned int max_sessions{ MCP_MAX_SESSIONS };
+
+        /** Inactive session timeout in seconds (0 = disabled) */
+        unsigned int session_timeout{ MCP_SESSION_TIMEOUT };
+
+        #ifdef MCP_SSL        
+        /**
+         * @brief SSL configuration settings.
+         *
+         * Contains optional paths to the server certificate and private key.
+         * These are used when SSL support is enabled.
+         */
+        struct {
+            /** Path to the server certificate */
+            std::optional<std::string> server_cert_path{ std::nullopt };
+
+            /** Path to the server private key */
+            std::optional<std::string> server_private_key_path{ std::nullopt };
+        } ssl;
+        #endif
+    };
+
     /**
      * @brief Constructor
-     * @param host The host to bind to (e.g., "localhost", "0.0.0.0")
-     * @param port The port to listen on
-     * @param name The name of the server
-     * @param version The version of the server
-     * @param sse_endpoint The endpoint for server-sent events
-     * @param msg_endpoint The endpoint for messages
+     * @param conf The server configuration
      */
-    server(const std::string& host = "localhost", 
-        int port = 8080, 
-        const std::string& name = "MCP Server",
-        const std::string& version = "0.0.1",
-        const std::string& sse_endpoint = "/sse",
-        const std::string& msg_endpoint = "/message");
+    server(const server::configuration& conf);   
     
     /**
      * @brief Destructor
@@ -223,7 +270,13 @@ public:
      * @param capabilities The capabilities of the server
      */
     void set_capabilities(const json& capabilities);
-    
+
+    /**
+     * @brief Set server instructions (returned in initialize response)
+     * @param instructions Human-readable instructions for the client
+     */
+    void set_instructions(const std::string& instructions);
+
     /**
      * @brief Register a method handler
      * @param method The method name
@@ -244,7 +297,27 @@ public:
      * @param resource The resource to register
      */
     void register_resource(const std::string& path, std::shared_ptr<resource> resource);
-    
+
+    /**
+     * @brief Register a resource template (2025-03-26 spec)
+     * @param uri_template RFC 6570 URI template (e.g. "myapp://items/{id}")
+     * @param name Human-readable name
+     * @param mime_type MIME type of the resource
+     * @param description Description of the template
+     * @param handler Function called with (uri, uriParams, session_id) to produce content
+     */
+    using resource_template_handler = std::function<json(
+        const std::string& uri,
+        const std::map<std::string, std::string>& uri_params,
+        const std::string& session_id)>;
+
+    void register_resource_template(
+        const std::string& uri_template,
+        const std::string& name,
+        const std::string& mime_type,
+        const std::string& description,
+        resource_template_handler handler);
+
     /**
      * @brief Register a tool
      * @param tool The tool to register
@@ -281,6 +354,18 @@ public:
     void send_request(const std::string& session_id, const request& req);
 
     /**
+     * @brief Broadcast a notification to all connected, initialized sessions
+     * @param notification The notification to send (must be a JSON-RPC notification, i.e. no id)
+     */
+    void broadcast_notification(const request& notification);
+
+    /**
+     * @brief Get list of active session IDs
+     * @return Vector of session IDs for connected, initialized clients
+     */
+    std::vector<std::string> get_active_sessions() const;
+
+    /**
      * @brief Set mount point for server
      * @param mount_point The mount point to set
      * @param dir The directory to serve from the mount point
@@ -295,7 +380,8 @@ private:
     std::string name_;
     std::string version_;
     json capabilities_;
-    
+    std::string instructions_;
+
     // The HTTP server
     std::unique_ptr<httplib::Server> http_server_;
     
@@ -311,9 +397,10 @@ private:
     // Session-specific event dispatchers
     std::map<std::string, std::shared_ptr<event_dispatcher>> session_dispatchers_;
 
-    // Server-sent events endpoint
+    // Endpoint paths
     std::string sse_endpoint_;
     std::string msg_endpoint_;
+    std::string mcp_endpoint_;
     
     // Method handlers
     std::map<std::string, method_handler> method_handlers_;
@@ -323,7 +410,17 @@ private:
     
     // Resources map (path -> resource)
     std::map<std::string, std::shared_ptr<resource>> resources_;
-    
+
+    // Resource templates (2025-03-26 spec)
+    struct resource_template_entry {
+        std::string uri_template;
+        std::string name;
+        std::string mime_type;
+        std::string description;
+        resource_template_handler handler;
+    };
+    std::vector<resource_template_entry> resource_templates_;
+
     // Tools map (name -> handler)
     std::map<std::string, std::pair<tool, tool_handler>> tools_;
     
@@ -335,6 +432,12 @@ private:
     
     // Running flag
     bool running_ = false;
+
+    // Max sessions limit
+    unsigned int max_sessions_ = MCP_MAX_SESSIONS;
+
+    // Inactive session timeout
+    unsigned int session_timeout_ = MCP_SESSION_TIMEOUT;
     
     // Thread pool for async method handlers
     thread_pool thread_pool_;
@@ -342,11 +445,17 @@ private:
     // Map to track session initialization status (session_id -> initialized)
     std::map<std::string, bool> session_initialized_;
 
-    // Handle SSE requests
+    // Legacy HTTP+SSE transport (2024-11-05)
     void handle_sse(const httplib::Request& req, httplib::Response& res);
-    
-    // Handle incoming JSON-RPC requests
     void handle_jsonrpc(const httplib::Request& req, httplib::Response& res);
+
+    // Streamable HTTP transport (2025-03-26)
+    void handle_mcp_post(const httplib::Request& req, httplib::Response& res);
+    void handle_mcp_get(const httplib::Request& req, httplib::Response& res);
+    void handle_mcp_delete(const httplib::Request& req, httplib::Response& res);
+
+    // Parse a single JSON-RPC message from JSON
+    request parse_jsonrpc_message(const json& j) const;
 
     // Send a JSON-RPC message to a client
     void send_jsonrpc(const std::string& session_id, const json& message);
@@ -391,7 +500,11 @@ private:
 
     // Session management and maintenance
     void check_inactive_sessions();
+
+    std::mutex maintenance_mutex_;
+    std::condition_variable maintenance_cond_;
     std::unique_ptr<std::thread> maintenance_thread_;
+    bool maintenance_thread_run_ = false;
 
     // Session cleanup handler
     std::map<std::string, session_cleanup_handler> session_cleanup_handler_;
